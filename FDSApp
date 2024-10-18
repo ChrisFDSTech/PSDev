@@ -1,0 +1,274 @@
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+Import-Module Microsoft.Graph.Intune
+
+[xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="FDSTool" Height="768" Width="1024">
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        
+        <ListView Name="GroupListView" Grid.Column="0" Margin="10">
+            <ListView.View>
+                <GridView>
+                    <GridViewColumn Header="Intune Groups" Width="Auto"/>
+                </GridView>
+            </ListView.View>
+        </ListView>
+        
+        <StackPanel Grid.Column="1" Margin="10">
+            <StackPanel Orientation="Horizontal">
+                <Button Name="AppsButton" Content="Apps" Width="100" Margin="0,0,10,0"/>
+                <Button Name="DeviceConfigButton" Content="Device Configurations" Width="150" Margin="0,0,10,0"/>
+                <Button Name="ScriptsButton" Content="Scripts" Width="100"/>
+            </StackPanel>
+            <ListBox Name="OptionsContent" Margin="0,10,0,0" Height="500"/>
+        </StackPanel>
+    </Grid>
+</Window>
+"@
+
+$reader = New-Object System.Xml.XmlNodeReader $xaml
+$window = [Windows.Markup.XamlReader]::Load($reader)
+
+$groupListView = $window.FindName("GroupListView")
+$appsButton = $window.FindName("AppsButton")
+$deviceConfigButton = $window.FindName("DeviceConfigButton")
+$scriptsButton = $window.FindName("ScriptsButton")
+$optionsContent = $window.FindName("OptionsContent")
+
+function Show-InitialForm {
+    [xml]$loginXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Login" Height="200" Width="300">
+    <StackPanel Margin="10">
+        <Image Source="C:\tools\Logos\logo.png" Height="100" Margin="0,0,0,10"/>
+        <Button Name="SignInButton" Content="Sign In" Width="100"/>
+    </StackPanel>
+</Window>
+"@
+
+    $reader = New-Object System.Xml.XmlNodeReader $loginXaml
+    $loginWindow = [Windows.Markup.XamlReader]::Load($reader)
+
+    $signInButton = $loginWindow.FindName("SignInButton")
+
+    $signInButton.Add_Click({
+        try {
+            Connect-MgGraph -Scopes "User.Read.All", "Device.Read.All", "DeviceManagementApps.Read.All", "DeviceManagementConfiguration.Read.All", "DeviceManagementManagedDevices.Read.All"
+            $context = Get-MgContext
+            if ($context) {
+                [System.Windows.MessageBox]::Show("Successfully authenticated as: " + $context.Account, "Success", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                $loginWindow.Close()
+                Show-MainForm
+            }
+        }
+        catch {
+            [System.Windows.MessageBox]::Show("Authentication failed: $_", "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+        }
+    })
+
+    $loginWindow.ShowDialog()
+}
+
+function Show-MainForm {
+    # Fetch and populate Intune groups
+    $groups = Get-MgGroup -All | Where-Object { 
+        $_.SecurityEnabled -eq $true
+    } | Sort-Object DisplayName
+    foreach ($group in $groups) {
+        $groupListView.Items.Add($group.DisplayName)
+    }
+
+    $appsButton.Add_Click({
+        try {
+            $selectedGroup = $groupListView.SelectedItem
+            if ($selectedGroup) {
+                $groupId = $groups[$groupListView.SelectedIndex].Id
+                $allApps = Get-MgDeviceAppManagementMobileApp -All | Where-Object { 
+                    $_.AdditionalProperties.'@odata.type' -in (
+                        '#microsoft.graph.win32LobApp', 
+                        '#microsoft.graph.windowsMobileMSI', 
+                        '#microsoft.graph.microsoftStoreForBusinessApp',
+                        '#microsoft.graph.windowsStoreApp'
+                    )
+                }
+                
+                $assignedRequired = @()
+                $assignedAvailable = @()
+                $assignedUninstall = @()
+                $availableApps = @()
+                $allUsersRequired = @()
+                $allUsersAvailable = @()
+                $allUsersUninstall = @()
+                foreach ($app in $allApps) {
+                    $assignments = Get-MgDeviceAppManagementMobileAppAssignment -MobileAppId $app.Id
+                    $groupAssignment = $assignments | Where-Object { $_.Target.AdditionalProperties.groupId -eq $groupId }
+                    $allUsersAssignment = $assignments | Where-Object { 
+                        $_.Target.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.allLicensedUsersAssignmentTarget' -or
+                        $_.Target.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.allDevicesAssignmentTarget'
+                    }
+                  
+                    if ($groupAssignment) {
+                        switch ($groupAssignment.Intent) {
+                            'required' { $assignedRequired += $app }
+                            'available' { $assignedAvailable += $app }
+                            'uninstall' { $assignedUninstall += $app }
+                        }
+                    }
+                  
+                    if ($allUsersAssignment) {
+                        switch ($allUsersAssignment.Intent) {
+                            'required' { $allUsersRequired += $app }
+                            'available' { $allUsersAvailable += $app }
+                            'uninstall' { $allUsersUninstall += $app }
+                        }
+                    }
+                  
+                    if (-not ($groupAssignment -or $allUsersAssignment)) {
+                        $availableApps += $app
+                    }
+                }
+                
+                # Display results (including the new all users/devices sections)
+                $optionsContent.Items.Clear()
+                $optionsContent.Items.Add("Assigned Required:")
+                $assignedRequired | ForEach-Object { $optionsContent.Items.Add("  " + $_.DisplayName) }
+                $optionsContent.Items.Add("")
+                $optionsContent.Items.Add("Assigned Available:")
+                $assignedAvailable | ForEach-Object { $optionsContent.Items.Add("  " + $_.DisplayName) }
+                $optionsContent.Items.Add("")
+                $optionsContent.Items.Add("Assigned Uninstall:")
+                $assignedUninstall | ForEach-Object { $optionsContent.Items.Add("  " + $_.DisplayName) }
+                $optionsContent.Items.Add("")
+                $optionsContent.Items.Add("Available Apps:")
+                $availableApps | ForEach-Object { $optionsContent.Items.Add("  " + $_.DisplayName) }
+                $optionsContent.Items.Add("")
+                $optionsContent.Items.Add("Assigned to All Users/Devices (Required):")
+                $allUsersRequired | ForEach-Object { $optionsContent.Items.Add("  " + $_.DisplayName) }
+                $optionsContent.Items.Add("")
+                $optionsContent.Items.Add("Assigned to All Users/Devices (Available):")
+                $allUsersAvailable | ForEach-Object { $optionsContent.Items.Add("  " + $_.DisplayName) }
+                $optionsContent.Items.Add("")
+                $optionsContent.Items.Add("Assigned to All Users/Devices (Uninstall):")
+                $allUsersUninstall | ForEach-Object { $optionsContent.Items.Add("  " + $_.DisplayName) }
+
+                # Add context menu for available apps
+                $contextMenu = New-Object System.Windows.Controls.ContextMenu
+                $requiredMenuItem = New-Object System.Windows.Controls.MenuItem
+                $requiredMenuItem.Header = "Assign as Required"
+                $availableMenuItem = New-Object System.Windows.Controls.MenuItem
+                $availableMenuItem.Header = "Assign as Available"
+                $uninstallMenuItem = New-Object System.Windows.Controls.MenuItem
+                $uninstallMenuItem.Header = "Assign as Uninstall"
+
+                $contextMenu.Items.Add($requiredMenuItem)
+                $contextMenu.Items.Add($availableMenuItem)
+                $contextMenu.Items.Add($uninstallMenuItem)
+
+                $optionsContent.ContextMenu = $contextMenu
+
+                $assignApp = {
+                    param($intent)
+                    $selectedItem = $optionsContent.SelectedItem
+                    if ($selectedItem -and $selectedItem.ToString().StartsWith("  ")) {
+                        $appName = $selectedItem.ToString().Trim()
+                        $app = $availableApps | Where-Object { $_.DisplayName -eq $appName }
+                        if ($app) {
+                            $params = @{
+                                "@odata.type" = "#microsoft.graph.mobileAppAssignment"
+                                Intent = $intent
+                                Target = @{
+                                    "@odata.type" = "#microsoft.graph.groupAssignmentTarget"
+                                    GroupId = $groupId
+                                }
+                            }
+                            New-MgDeviceAppManagementMobileAppAssignment -MobileAppId $app.Id -BodyParameter $params
+                            [System.Windows.MessageBox]::Show("App assigned successfully!", "Success", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                            & $appsButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+                        }
+                    }
+                }
+
+                $requiredMenuItem.Add_Click({ & $assignApp 'required' })
+                $availableMenuItem.Add_Click({ & $assignApp 'available' })
+                $uninstallMenuItem.Add_Click({ & $assignApp 'uninstall' })
+            } else {
+                [System.Windows.MessageBox]::Show("Please select a group first.", "No Group Selected", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+            }
+        }
+        catch {
+            Show-Error "Error fetching apps: $_"
+        }
+    })
+
+    $deviceConfigButton.Add_Click({
+        try {
+            $optionsContent.Items.Clear()
+            $optionsContent.Items.Add("List Configurations")
+            $optionsContent.Items.Add("Add Configuration")
+            $optionsContent.Items.Add("Remove Configuration")
+            $optionsContent.Items.Add("Update Configuration")
+        }
+        catch {
+            Show-Error "Error loading device configurations: $_"
+        }
+    })
+
+    $scriptsButton.Add_Click({
+        try {
+            $optionsContent.Items.Clear()
+            $optionsContent.Items.Add("List Scripts")
+            $optionsContent.Items.Add("Add Script")
+            $optionsContent.Items.Add("Remove Script")
+            $optionsContent.Items.Add("Run Script")
+        }
+        catch {
+            Show-Error "Error loading scripts: $_"
+        }
+    })
+
+    $window.ShowDialog()
+}
+
+function Show-Error {
+    param (
+        [string]$ErrorMessage
+    )
+    Write-Host "Error: $ErrorMessage" -ForegroundColor Red
+}
+
+Show-InitialForm
+
+$allApps = Get-MgDeviceAppManagementMobileApp -All
+
+foreach ($app in $allApps) {
+    $appType = $app.AdditionalProperties.'@odata.type'
+    $appId = $app.Id
+    $appName = $app.DisplayName
+    Write-Host "App Name: $appName, Type: $appType, ID: $appId"
+}
+
+$filteredApps = $allApps | Where-Object { 
+    $_.AdditionalProperties.'@odata.type' -in (
+        '#microsoft.graph.win32LobApp', 
+        '#microsoft.graph.windowsMobileMSI', 
+        '#microsoft.graph.microsoftStoreForBusinessApp',
+        '#microsoft.graph.windowsStoreApp',
+        '#microsoft.graph.officeSuiteApp'
+    ) -or $_.IsAssigned -eq $true
+}
+
+# Use the $filteredApps variable
+foreach ($app in $filteredApps) {
+    $appType = $app.AdditionalProperties.'@odata.type'
+    $appId = $app.Id
+    $appName = $app.DisplayName
+    Write-Host "Filtered App Name: $appName, Type: $appType, ID: $appId"
+}
